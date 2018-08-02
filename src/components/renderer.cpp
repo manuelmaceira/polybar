@@ -7,6 +7,7 @@
 #include "utils/file.hpp"
 #include "utils/math.hpp"
 #include "x11/atoms.hpp"
+#include "x11/background_manager.hpp"
 #include "x11/connection.hpp"
 #include "x11/extensions/all.hpp"
 #include "x11/winspec.hpp"
@@ -25,7 +26,8 @@ renderer::make_type renderer::make(const bar_settings& bar) {
       signal_emitter::make(),
       config::make(),
       logger::make(),
-      forward<decltype(bar)>(bar));
+      forward<decltype(bar)>(bar),
+      background_manager::make());
   // clang-format on
 }
 
@@ -33,13 +35,15 @@ renderer::make_type renderer::make(const bar_settings& bar) {
  * Construct renderer instance
  */
 renderer::renderer(
-    connection& conn, signal_emitter& sig, const config& conf, const logger& logger, const bar_settings& bar)
+    connection& conn, signal_emitter& sig, const config& conf, const logger& logger, const bar_settings& bar, background_manager& background)
     : m_connection(conn)
     , m_sig(sig)
     , m_conf(conf)
     , m_log(logger)
     , m_bar(forward<const bar_settings&>(bar))
+    , m_background(background)
     , m_rect(m_bar.inner_area()) {
+
   m_sig.attach(this);
   m_log.trace("renderer: Get TrueColor visual");
   {
@@ -160,6 +164,9 @@ renderer::renderer(
       m_log.info("Loaded font \"%s\" (name=%s, offset=%i, file=%s)", pattern, font->name(), offset, font->file());
       *m_context << move(font);
     }
+
+    m_log.trace("Activate root background manager");
+    m_background.activate(m_window, m_bar.outer_area(false));
   }
 
   m_comp_bg = m_conf.get<cairo_operator_t>("settings", "compositing-background", m_comp_bg);
@@ -167,6 +174,8 @@ renderer::renderer(
   m_comp_ol = m_conf.get<cairo_operator_t>("settings", "compositing-overline", m_comp_ol);
   m_comp_ul = m_conf.get<cairo_operator_t>("settings", "compositing-underline", m_comp_ul);
   m_comp_border = m_conf.get<cairo_operator_t>("settings", "compositing-border", m_comp_border);
+
+  m_pseudo_transparency = m_conf.get<bool>("settings", "pseudo-transparency", m_pseudo_transparency);
 
   m_fixedcenter = m_conf.get(m_conf.section(), "fixed-center", true);
 }
@@ -205,7 +214,7 @@ void renderer::begin(xcb_rectangle_t rect) {
   m_align = alignment::NONE;
 
   // Reset colors
-  m_bg = m_bar.background;
+  m_bg = 0x0;
   m_fg = m_bar.foreground;
   m_ul = m_bar.underline.color;
   m_ol = m_bar.overline.color;
@@ -213,6 +222,11 @@ void renderer::begin(xcb_rectangle_t rect) {
   // Clear canvas
   m_context->save();
   m_context->clear();
+
+  // Draw the background as base layer so that everything
+  // else is drawn on top of it
+  fill_background();
+
 
   // Create corner mask
   if (m_bar.radius && m_cornermask == nullptr) {
@@ -260,10 +274,6 @@ void renderer::end() {
     // Capture the concatenated block contents
     // so that it can be masked with the corner pattern
     m_context->push();
-
-    // Draw the background on the new layer to make up for
-    // the areas not covered by the alignment blocks
-    fill_background();
 
     for (auto&& b : m_blocks) {
       flush(b.first);
@@ -495,6 +505,21 @@ void renderer::fill_background() {
   m_context->save();
   *m_context << m_comp_bg;
 
+  // if using pseudo-transparency, fill the background with the root window's contents
+  // otherwise, we simply use a fully transparent base layer
+  if(m_pseudo_transparency) {
+    auto root_bg = m_background.get_surface();
+    if(root_bg != nullptr) {
+      m_log.trace_x("renderer: root background");
+      *m_context << *root_bg;
+    }
+  } else {
+    *m_context << (unsigned int)0;
+  }
+
+  m_context->paint();
+  *m_context << CAIRO_OPERATOR_OVER;
+
   if (!m_bar.background_steps.empty()) {
     m_log.trace_x("renderer: gradient background (steps=%lu)", m_bar.background_steps.size());
     *m_context << cairo::linear_gradient{0.0, 0.0 + m_rect.y, 0.0, 0.0 + m_rect.height, m_bar.background_steps};
@@ -718,8 +743,6 @@ bool renderer::on(const signals::parser::change_alignment& evt) {
     m_blocks[m_align].y = 0.0;
     m_context->push();
     m_log.trace_x("renderer: push(%i)", static_cast<int>(m_align));
-
-    fill_background();
   }
   return true;
 }
